@@ -1,0 +1,5 @@
+*.exe
+*.dll
+node_modules/
+# Built by proton/fix-emoji.sh from your local Twemoji font
+proton/seguiemj-v2.ttf

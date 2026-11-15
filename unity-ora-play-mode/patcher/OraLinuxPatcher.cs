@@ -10,7 +10,10 @@
 //    refuses without root. The exception skipped recording the process, so Unity couldn't
 //    stop it later. The setters go through helpers that do nothing on Linux.
 //
-// Usage: mono OraLinuxPatcher.exe <path/to/SideQuest.Ora.dll>
+// Usage: mono OraLinuxPatcher.exe <path/to/SideQuest.Ora.dll> [assembly folder...]
+// The extra folders are where to find the assemblies SideQuest.Ora.dll references (Unity's
+// Editor/Data/Managed/UnityEngine, say): Cecil needs them to read some of its attributes. The
+// project's Library/ScriptAssemblies is searched too, when the DLL is inside a project.
 // Idempotent: exits 0 without changes when the DLL already has every patch. A DLL with an
 // older version of the patch is re-patched from the original kept in <dll>.orig~.
 using System;
@@ -31,10 +34,12 @@ static class OraLinuxPatcher
 
     static int Main(string[] args)
     {
-        if (args.Length != 1) { Console.Error.WriteLine("usage: OraLinuxPatcher <SideQuest.Ora.dll>"); return 2; }
+        if (args.Length < 1) { Console.Error.WriteLine("usage: OraLinuxPatcher <SideQuest.Ora.dll> [assembly folder...]"); return 2; }
         var path = Path.GetFullPath(args[0]);
         var resolver = new DefaultAssemblyResolver();
         resolver.AddSearchDirectory(Path.GetDirectoryName(path));
+        foreach (var dir in args.Skip(1).Concat(new[] { ScriptAssemblies(path) }).Concat(UnityManaged()))
+            if (!string.IsNullOrEmpty(dir) && Directory.Exists(dir)) resolver.AddSearchDirectory(dir);
 
         var backup = path + ".orig~"; // trailing ~ : Unity ignores it
         byte[] current = File.ReadAllBytes(path);
@@ -99,6 +104,26 @@ static class OraLinuxPatcher
         module.Write(path);
         Console.WriteLine("patched: " + path + " (original: " + backup + ")");
         return 0;
+    }
+
+    // Run with a Unity editor's Mono (<Editor>/Data/MonoBleedingEdge), its Data/Managed folders: so an editor script that
+    // passes only the DLL still gets UnityEngine.CoreModule and the rest.
+    static string[] UnityManaged()
+    {
+        var corlib = typeof(object).Assembly.Location; // <Data>/MonoBleedingEdge/lib/mono/4.5/mscorlib.dll
+        var data = corlib;
+        for (var i = 0; i < 5 && !string.IsNullOrEmpty(data); i++) data = Path.GetDirectoryName(data);
+        if (string.IsNullOrEmpty(data)) return new string[0];
+        var managed = Path.Combine(data, "Managed");
+        return new[] { Path.Combine(managed, "UnityEngine"), managed };
+    }
+
+    // <project>/Library/ScriptAssemblies, for a DLL somewhere under <project>/Library; else null.
+    static string ScriptAssemblies(string dll)
+    {
+        for (var dir = Path.GetDirectoryName(dll); !string.IsNullOrEmpty(dir); dir = Path.GetDirectoryName(dir))
+            if (Path.GetFileName(dir) == "Library") return Path.Combine(dir, "ScriptAssemblies");
+        return null;
     }
 
     static ModuleDefinition Read(byte[] bytes, IAssemblyResolver resolver) =>

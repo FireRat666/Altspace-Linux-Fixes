@@ -13,6 +13,7 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using UnityEditor;
 using Debug = UnityEngine.Debug;
 
@@ -55,6 +56,19 @@ static class OraLinuxSetup
         // PatchV3 marks the current patch (see OraLinuxPatcher.LatestMarker); older patched DLLs get re-patched.
         if (oraAssembly.GetType("SideQuest.Ora.OraLinuxShm")?.GetMethod("PatchV3") == null)
         {
+            // A patch that failed isn't retried on every reload (it would run each time the scripts compile): only once
+            // the DLL changes, or from Tools > Ora Linux > Re-apply Ora DLL Patch.
+            var dll = OraDllPath();
+            if (dll != null && EditorPrefs.GetString(FailedKey, "") == DllStamp(dll))
+            {
+                if (!SessionState.GetBool("OraLinuxSetup.FailedLogged", false))
+                {
+                    SessionState.SetBool("OraLinuxSetup.FailedLogged", true);
+                    Debug.LogWarning($"{Tag} SideQuest.Ora.dll isn't patched for Linux: the last patch failed (see the log). " +
+                                     "Use Tools > Ora Linux > Re-apply Ora DLL Patch to try again.");
+                }
+                return;
+            }
             Debug.Log($"{Tag} SideQuest.Ora.dll isn't fully patched for Linux yet; patching.");
             EditorApplication.delayCall += PatchOraDll;
         }
@@ -65,17 +79,40 @@ static class OraLinuxSetup
         }
     }
 
+    const string FailedKey = "OraLinuxSetup.FailedFor";
+    // How long the patcher may take before it's stopped. It runs off the main thread, so the editor never waits on it.
+    const int PatchTimeoutMs = 60000;
+
+    static string OraDllPath()
+    {
+        var package = UnityEditor.PackageManager.PackageInfo.FindForAssetPath("Packages/" + OraPackage);
+        return package == null ? null : Path.Combine(package.resolvedPath, "Plugins", "SideQuest.Ora.dll");
+    }
+
+    // Which DLL a failure was for: its path, size and time, so a new or re-downloaded DLL is tried again.
+    static string DllStamp(string dll)
+    {
+        var info = new FileInfo(dll);
+        return info.Exists ? $"{dll}|{info.Length}|{info.LastWriteTimeUtc.Ticks}" : dll;
+    }
+
+    static bool patching;
+
     [MenuItem("Tools/Ora Linux/Re-apply Ora DLL Patch")]
     static void PatchOraDll()
     {
-        var package = UnityEditor.PackageManager.PackageInfo.FindForAssetPath("Packages/" + OraPackage);
-        if (package == null) { Debug.LogError($"{Tag} {OraPackage} not found."); return; }
-        var dll = Path.Combine(package.resolvedPath, "Plugins", "SideQuest.Ora.dll");
+        if (patching) { Debug.Log($"{Tag} A patch is already running."); return; }
+        var dll = OraDllPath();
+        if (dll == null) { Debug.LogError($"{Tag} {OraPackage} not found."); return; }
         var patcher = Path.Combine(Home, "patcher", "OraLinuxPatcher.exe");
         if (!File.Exists(patcher)) { Debug.LogError($"{Tag} Patcher missing: {patcher}"); return; }
 
-        var monoDir = Path.Combine(EditorApplication.applicationContentsPath, "MonoBleedingEdge");
-        var psi = new ProcessStartInfo(Path.Combine(monoDir, "bin", "mono"), $"\"{patcher}\" \"{dll}\"")
+        var data = EditorApplication.applicationContentsPath;
+        var monoDir = Path.Combine(data, "MonoBleedingEdge");
+        // The assemblies SideQuest.Ora.dll references (UnityEngine.CoreModule and so on), for Cecil to resolve.
+        var managed = Path.Combine(data, "Managed");
+        var args = $"\"{patcher}\" \"{dll}\" \"{Path.Combine(managed, "UnityEngine")}\" \"{managed}\"";
+        var psi = new ProcessStartInfo(Path.Combine(monoDir, "bin", "mono"), args)
         {
             UseShellExecute = false,
             RedirectStandardOutput = true,
@@ -83,15 +120,56 @@ static class OraLinuxSetup
             CreateNoWindow = true,
         };
         psi.EnvironmentVariables["MONO_PATH"] = Path.Combine(monoDir, "lib", "mono", "4.5");
-        using (var p = Process.Start(psi))
+
+        patching = true;
+        int exitCode = -1;
+        string output = "";
+        var done = false;
+        new Thread(() =>
         {
-            var output = p.StandardOutput.ReadToEnd() + p.StandardError.ReadToEnd();
-            p.WaitForExit();
-            if (p.ExitCode != 0) { Debug.LogError($"{Tag} Patching SideQuest.Ora.dll failed:\n{output}"); return; }
+            try
+            {
+                using (var p = Process.Start(psi))
+                {
+                    // Both streams at once, so a full stderr pipe can't stall the patcher.
+                    var err = p.StandardError.ReadToEndAsync();
+                    var outText = p.StandardOutput.ReadToEndAsync();
+                    if (!p.WaitForExit(PatchTimeoutMs))
+                    {
+                        try { p.Kill(); } catch (Exception) { }
+                        output = $"timed out after {PatchTimeoutMs / 1000} s and was stopped";
+                    }
+                    else
+                    {
+                        p.WaitForExit();
+                        exitCode = p.ExitCode;
+                        output = (outText.Wait(5000) ? outText.Result : "") + (err.Wait(5000) ? err.Result : "");
+                    }
+                }
+            }
+            catch (Exception e) { output = e.ToString(); }
+            done = true;
+        }) { IsBackground = true, Name = "Ora Linux patcher" }.Start();
+
+        // Back on the main thread once it's finished.
+        EditorApplication.CallbackFunction check = null;
+        check = () =>
+        {
+            if (!done) return;
+            EditorApplication.update -= check;
+            patching = false;
+            if (exitCode != 0)
+            {
+                EditorPrefs.SetString(FailedKey, DllStamp(dll));
+                Debug.LogError($"{Tag} Patching SideQuest.Ora.dll failed:\n{output}");
+                return;
+            }
+            EditorPrefs.DeleteKey(FailedKey);
             Debug.Log($"{Tag} {output.Trim()}");
-        }
-        // Reimport so the editor reloads the patched assembly.
-        AssetDatabase.ImportAsset(DllAssetPath, ImportAssetOptions.ForceUpdate);
+            // Reimport so the editor reloads the patched assembly.
+            AssetDatabase.ImportAsset(DllAssetPath, ImportAssetOptions.ForceUpdate);
+        };
+        EditorApplication.update += check;
     }
 }
 #endif

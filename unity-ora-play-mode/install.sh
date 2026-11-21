@@ -8,9 +8,12 @@
 #   app/       Ora's own Electron app from the package, with our Linux patches applied
 #   bin/       the launcher Unity runs in place of ora-windows.exe
 #   patcher/   the SideQuest.Ora.dll patcher (run by the editor script)
-# and copies unity/OraLinuxSetup.cs to <project>/Assets/Editor/OraLinux/.
+# and copies unity/OraLinuxSetup.cs to <project>/Assets/Editor/OraLinux/. For Ora 0.2 and later it also builds
+# native/ (the Unity <-> browser link): ora-link.node goes into app/dist, libora-audio.so into
+# <project>/Assets/Editor/OraLinux/Plugins.
 #
-# Needs: curl, unzip, sha256sum, node/npx (for @electron/asar), and a Unity editor under ~/Unity/Hub/Editor
+# Needs: curl, unzip, sha256sum, node/npx (for @electron/asar), a C compiler and make (Ora 0.2), the Node-API
+# headers (/usr/include/node, or node's own), and a Unity editor under ~/Unity/Hub/Editor
 # (or UNITY_EDITOR=<.../Editor> pointing at one) for its bundled Mono and Cecil.
 set -euo pipefail
 
@@ -63,6 +66,16 @@ rm -rf "$DEST/app"
 npx --yes @electron/asar extract "$WINDOWS_DIR/resources/app.asar" "$DEST/app"
 node "$REPO/app/apply-patches.js" "$DEST/app"
 
+# --- Ora 0.2 link (Linux build of ora-link.node and ora-audio) -------------------------------------
+LINK=0
+if [ -f "$DEST/app/dist/link.js" ]; then
+  LINK=1
+  step "Browser link (Ora 0.2)"
+  make -s -C "$REPO/native"
+  cp "$REPO/native/build/ora-link.node" "$DEST/app/dist/ora-link.node"
+  echo "$DEST/app/dist/ora-link.node"
+fi
+
 # --- Launcher -----------------------------------------------------------------------------------
 step "Launcher"
 mkdir -p "$DEST/bin"
@@ -104,6 +117,13 @@ if [ "$PROJECT_SCRIPT" = 1 ]; then
   mkdir -p "$PROJECT/Assets/Editor/OraLinux"
   cp "$REPO/unity/OraLinuxSetup.cs" "$PROJECT/Assets/Editor/OraLinux/OraLinuxSetup.cs"
   echo "$PROJECT/Assets/Editor/OraLinux/OraLinuxSetup.cs"
+  if [ "$LINK" = 1 ]; then
+    # Unity's half of the link, as the "ora-audio" plugin, for the Linux editor only.
+    mkdir -p "$PROJECT/Assets/Editor/OraLinux/Plugins"
+    cp "$REPO/native/build/libora-audio.so" "$PROJECT/Assets/Editor/OraLinux/Plugins/libora-audio.so"
+    cp "$REPO/unity/libora-audio.so.meta" "$PROJECT/Assets/Editor/OraLinux/Plugins/libora-audio.so.meta"
+    echo "$PROJECT/Assets/Editor/OraLinux/Plugins/libora-audio.so"
+  fi
 fi
 
 step "Done"
